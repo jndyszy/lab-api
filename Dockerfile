@@ -15,6 +15,6 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
 # ---- 运行阶段 ----
 FROM gcr.io/distroless/static-debian13:nonroot
 COPY --from=build /out/lab-api /lab-api
-USER nonroot:nonroot
+USER 65532:65532
 EXPOSE 8080
 ENTRYPOINT ["/lab-api"]
