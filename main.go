@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -63,14 +63,29 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
-// instrument 给业务接口加上请求计数和耗时统计
+// instrument 给业务接口加上请求计数、耗时统计和访问日志
+// 只包装业务接口；探针和 /metrics 不记访问日志，避免每 2 秒一条的噪音
 func instrument(path string, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, code: http.StatusOK}
 		h(rec, r)
-		duration.WithLabelValues(path).Observe(time.Since(start).Seconds())
+		elapsed := time.Since(start)
+		duration.WithLabelValues(path).Observe(elapsed.Seconds())
 		requests.WithLabelValues(path, strconv.Itoa(rec.code)).Inc()
+
+		// 结构化访问日志：每个字段都是独立的 JSON 键，Loki 中可用 | json 直接按字段过滤
+		level := slog.LevelInfo
+		if rec.code >= 500 {
+			level = slog.LevelError
+		}
+		slog.LogAttrs(r.Context(), level, "request",
+			slog.String("method", r.Method),
+			slog.String("path", path),
+			slog.Int("status", rec.code),
+			slog.Float64("duration_ms", float64(elapsed.Microseconds())/1000),
+			slog.String("remote_addr", r.RemoteAddr),
+		)
 	}
 }
 
@@ -107,6 +122,8 @@ func newMux(cfg config, hostname string, ready *atomic.Bool) *http.ServeMux {
 }
 
 func main() {
+	// 日志统一输出 JSON 到 stdout，由节点上的采集器（Alloy）收集到 Loki
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("service", "lab-api", "version", version))
 	cfg := loadConfig()
 	hostname, _ := os.Hostname()
 	var ready atomic.Bool
@@ -121,10 +138,10 @@ func main() {
 	srv := &http.Server{Addr: addr, Handler: newMux(cfg, hostname, &ready), ReadHeaderTimeout: 5 * time.Second}
 
 	go func() {
-		log.Printf("lab-api %s listening on %s (FAIL_RATE=%.2f LATENCY_MS=%d)",
-			version, addr, cfg.failRate, cfg.latency.Milliseconds())
+		slog.Info("listening", "addr", addr, "fail_rate", cfg.failRate, "latency_ms", cfg.latency.Milliseconds())
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
+			slog.Error("server failed", "err", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -132,15 +149,15 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 	<-stop
-	log.Print("received shutdown signal")
+	slog.Info("received shutdown signal")
 	ready.Store(false)
 	time.Sleep(5 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("shutdown error: %v", err)
+		slog.Error("shutdown error", "err", err)
 	}
-	log.Print("bye")
+	slog.Info("bye")
 }
 
 func getenv(k, def string) string {

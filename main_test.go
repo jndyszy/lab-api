@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -62,5 +65,28 @@ func TestLoadConfig(t *testing.T) {
 	t.Setenv("FAIL_RATE", "5") // 超出范围，忽略
 	if c := loadConfig(); c.failRate != 0 {
 		t.Fatalf("FAIL_RATE=5 should be ignored, got %v", c.failRate)
+	}
+}
+
+func TestAccessLogJSON(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+
+	serve(t, config{failRate: 1}, true, "/")
+	var entry map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
+		t.Fatalf("access log is not JSON: %v (%q)", err, buf.String())
+	}
+	if entry["msg"] != "request" || entry["level"] != "ERROR" || entry["status"] != float64(500) || entry["path"] != "/" {
+		t.Fatalf("unexpected access log: %v", entry)
+	}
+
+	// 探针不记访问日志
+	buf.Reset()
+	serve(t, config{}, true, "/healthz")
+	if buf.Len() != 0 {
+		t.Fatalf("healthz should not be logged, got %q", buf.String())
 	}
 }
