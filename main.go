@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"os/signal"
@@ -34,6 +35,23 @@ var (
 	}, []string{"path"})
 )
 
+// config 故障注入参数，用于演示 SLO 错误预算消耗与告警（阶段 3）
+type config struct {
+	failRate float64       // FAIL_RATE：/ 返回 500 的比例，0~1
+	latency  time.Duration // LATENCY_MS：/ 额外增加的延迟
+}
+
+func loadConfig() config {
+	c := config{}
+	if v, err := strconv.ParseFloat(getenv("FAIL_RATE", "0"), 64); err == nil && v >= 0 && v <= 1 {
+		c.failRate = v
+	}
+	if v, err := strconv.Atoi(getenv("LATENCY_MS", "0")); err == nil && v >= 0 {
+		c.latency = time.Duration(v) * time.Millisecond
+	}
+	return c
+}
+
 // statusRecorder 记录 handler 写出的状态码，供指标使用
 type statusRecorder struct {
 	http.ResponseWriter
@@ -56,13 +74,17 @@ func instrument(path string, h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func main() {
-	hostname, _ := os.Hostname()
-	var ready atomic.Bool
-	ready.Store(true)
-
+// newMux 组装所有路由；ready 为 false 时就绪探针返回 503
+func newMux(cfg config, hostname string, ready *atomic.Bool) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", instrument("/", func(w http.ResponseWriter, r *http.Request) {
+		if cfg.latency > 0 {
+			time.Sleep(cfg.latency)
+		}
+		if cfg.failRate > 0 && rand.Float64() < cfg.failRate {
+			http.Error(w, "injected failure", http.StatusInternalServerError)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
 			"service": "lab-api", "version": version, "hostname": hostname,
@@ -81,12 +103,26 @@ func main() {
 		w.Write([]byte("ready"))
 	})
 	mux.Handle("GET /metrics", promhttp.Handler())
+	return mux
+}
+
+func main() {
+	cfg := loadConfig()
+	hostname, _ := os.Hostname()
+	var ready atomic.Bool
+	ready.Store(true)
+
+	// 预先创建成功和失败两个时间序列（初始值 0），否则某个副本从没出过 500 时，
+	// 错误率查询里会缺这个序列
+	requests.WithLabelValues("/", "200")
+	requests.WithLabelValues("/", "500")
 
 	addr := ":" + getenv("PORT", "8080")
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: newMux(cfg, hostname, &ready), ReadHeaderTimeout: 5 * time.Second}
 
 	go func() {
-		log.Printf("lab-api %s listening on %s", version, addr)
+		log.Printf("lab-api %s listening on %s (FAIL_RATE=%.2f LATENCY_MS=%d)",
+			version, addr, cfg.failRate, cfg.latency.Milliseconds())
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}
