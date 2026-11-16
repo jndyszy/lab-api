@@ -1,4 +1,4 @@
-# lab-api CI：测试 → 构建 ARM64 镜像 → 推送到 Harbor lab 项目
+# lab-api CI/CD：测试 → 构建 ARM64 镜像 → 推送到 Harbor → 把新 tag 写回 K8s-VMware（ArgoCD 自动部署）
 name: ci
 
 on:
@@ -13,6 +13,8 @@ jobs:
   build:
     # GitHub 托管的 ARM64 Runner，原生构建 arm64 镜像，不需要 QEMU 模拟
     runs-on: ubuntu-24.04-arm
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -52,3 +54,43 @@ jobs:
           build-args: VERSION=${{ steps.meta.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # 镜像推送成功后，修改 K8s-VMware 里的 newTag，由 ArgoCD 完成部署
+  deploy:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    # 同一时间只允许一个写回任务，避免两次 push 同时改同一行产生冲突
+    concurrency:
+      group: gitops-writeback
+      cancel-in-progress: false
+    steps:
+      - name: 检出 K8s-VMware（部署密钥只对该仓库有写权限）
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: jndyszy/K8s-VMware
+          ssh-key: ${{ secrets.K8S_VMWARE_DEPLOY_KEY }}
+          path: gitops
+
+      - name: 更新镜像 tag 并推送
+        working-directory: gitops
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+        run: |
+          file=apps/lab-api/kustomization.yaml
+          sed -i -E "s/^([[:space:]]*newTag:).*/\1 ${TAG}/" "$file"
+          grep -q "newTag: ${TAG}$" "$file" || { echo "newTag 未更新，检查 $file"; exit 1; }
+          if git diff --quiet; then
+            echo "tag 已是 ${TAG}，无需提交"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "lab-api：部署 ${TAG}" -m "来源：${SOURCE_URL}"
+          # 期间若有其他提交，先变基再推送，最多重试 3 次
+          for _ in 1 2 3; do
+            git push && exit 0
+            git pull --rebase
+          done
+          exit 1
